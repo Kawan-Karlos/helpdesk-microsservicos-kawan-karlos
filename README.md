@@ -1,155 +1,195 @@
-# HelpDesk TI · versão monolítica
+# HelpDesk TI · versão em microsserviços
 
-Sistema de chamados de TI (no estilo de um GLPI simplificado), feito em **Python + FastAPI**.
-É a aplicação base da atividade de **Arquitetura de Software**: hoje ela é um **monólito**;
-a missão de cada aluno é transformá-la em **microsserviços** (veja [DESAFIO.md](DESAFIO.md)).
+> 🎥 **Vídeo de demonstração:** COLE_AQUI_O_LINK_DO_VIDEO
 
-## Telas do sistema
+Sistema de chamados de TI (no estilo de um GLPI simplificado), feito em Python + FastAPI.
+Começou como um monólito ([projeto base](https://github.com/prof-filipecavalcante/helpdesk-ti))
+e foi separado em microsserviços para a atividade de Arquitetura de Software (veja [DESAFIO.md](DESAFIO.md)).
 
-![Demonstração: entrar, abrir, atribuir, resolver e fechar um chamado](docs/demo.gif)
+![Demonstração](docs/demo.gif)
 
-| Login | Painel do técnico | Chamado resolvido |
-|---|---|---|
-| ![Login](docs/01-login.png) | ![Painel](docs/02-painel.png) | ![Chamado resolvido](docs/03-chamado-resolvido.png) |
+## Arquitetura
 
-## O que o sistema faz
+```mermaid
+flowchart LR
+    U([Navegador]) -->|"HTTP :8000<br/>(única porta exposta)"| GW[API Gateway<br/>tela + roteamento]
 
-- **Login** com e-mail e senha; cada pessoa vê e faz só o que o seu perfil permite.
-- Cadastra **usuários** e **equipamentos** (inventário de TI).
-- **Abre chamados** com prioridade e calcula o prazo de atendimento (SLA): crítica 4 h, alta 8 h, média 24 h, baixa 72 h.
-- **Atribui** chamados a técnicos, controla o **status** e aceita **comentários**.
-- Registra **notificações** quando um chamado é aberto, atribuído ou resolvido.
-- Mostra um **painel** com totais por status e chamados atrasados.
+    subgraph rede["Rede interna do Docker"]
+        GW -->|/auth, /usuarios| US[Usuários<br/>login e cadastro]
+        GW -->|/ativos| INV[Inventário]
+        GW -->|/chamados| CH[Chamados]
+        GW -->|/notificacoes| NT[Notificações]
 
-### Perfis e permissões
+        CH -->|"GET /usuarios/{id}<br/>token repassado, timeout 3 s"| US
+        CH -->|"GET /ativos/{id}<br/>token repassado, timeout 3 s"| INV
+        CH -.->|"publica ChamadoAberto,<br/>ChamadoAtribuido, ChamadoResolvido"| Q[(Redis<br/>fila de eventos)]
+        Q -.->|consome| NT
 
-| Ação | Solicitante | Técnico | Administrador |
-|---|:-:|:-:|:-:|
-| Abrir chamado | ✅ | ✅ | ✅ |
-| Ver chamados | só os seus | todos | todos |
-| Comentar | nos seus | todos | todos |
-| Atribuir e resolver | ❌ | ✅ | ✅ |
-| Fechar ou reabrir um chamado resolvido | os seus | ✅ | ✅ |
-| Cadastrar equipamentos | ❌ | ✅ | ✅ |
-| Cadastrar usuários | ❌ | ❌ | ✅ |
+        US --- DBU[(PostgreSQL<br/>usuarios)]
+        INV --- DBI[(PostgreSQL<br/>inventario)]
+        CH --- DBC[(PostgreSQL<br/>chamados)]
+        NT --- DBN[(PostgreSQL<br/>notificacoes)]
+    end
+```
+
+| Serviço | O que faz | Banco | Fala com |
+|---|---|---|---|
+| **gateway** | Serve a tela e encaminha cada rota para o serviço dono dela. `GET /saude` mostra quem está no ar. | nenhum | todos (HTTP) |
+| **usuarios** | Cadastro de usuários e login (emite o token JWT). | `db-usuarios` | ninguém |
+| **inventario** | Cadastro de equipamentos. | `db-inventario` | ninguém |
+| **chamados** | Abre, atribui, muda status, comenta, painel e SLA. | `db-chamados` | usuarios e inventario (HTTP), Redis (eventos) |
+| **notificacoes** | Lê os eventos da fila e grava os avisos de cada usuário. | `db-notificacoes` | Redis |
+
+Linhas cheias são chamadas HTTP (síncronas). Linhas tracejadas são eventos (assíncronos).
+
+### Estrutura
+
+```
+comum/                  # biblioteca técnica compartilhada: token JWT, cabeçalhos de segurança, erros
+gateway/                # API Gateway (FastAPI + httpx) e a tela (web/)
+servicos/
+├── usuarios/           # cada serviço: Dockerfile, requirements.txt, app/ e tests/ próprios
+├── inventario/
+├── chamados/           # app/clientes.py (HTTP) e app/eventos.py (fila)
+└── notificacoes/       # app/consumidor.py (lê a fila)
+docker-compose.yml      # sobe tudo: gateway, 4 serviços, 4 bancos, Redis
+```
 
 ## Como rodar
 
-**Com Docker**
+Precisa só do Docker.
 
 ```bash
 docker compose up --build
 ```
 
-**Sem Docker** (Python 3.11 ou mais novo)
+Depois abra **http://localhost:8000**. Não é preciso criar `.env`: na primeira subida, o
+contêiner `segredos` gera o segredo do JWT e a senha dos bancos em um volume do Docker.
+
+Comandos úteis:
 
 ```bash
-pip install -r requirements-dev.txt
-uvicorn app.main:app --reload
+docker compose ps                      # todos os contêineres no ar
+curl http://localhost:8000/saude       # quais serviços estão no ar
+docker compose stop inventario         # simula a queda de um serviço
+docker compose start inventario        # e traz de volta
+docker compose logs -f notificacoes    # eventos chegando
+docker volume ls | grep helpdesk       # um volume de dados por banco
+docker compose down -v                 # apaga tudo (inclusive os dados)
 ```
-
-Depois abra:
-
-- Tela do HelpDesk: http://localhost:8000
-- Documentação da API (Swagger): http://localhost:8000/docs (clique em **Authorize** e cole o token do login)
 
 ### Contas de acesso
 
-Não é preciso criar conta: o sistema já começa com estes usuários.
-Todos usam a senha **`Helpdesk2026`**.
+Criadas automaticamente com `DADOS_EXEMPLO=1` (padrão). Todas usam a senha `Helpdesk2026`.
 
-| E-mail | Perfil | O que pode fazer |
-|---|---|---|
-| `admin@empresa.com` | Administrador | Tudo, inclusive cadastrar usuários |
-| `carla@empresa.com` | Técnica | Ver todos os chamados, atribuir, resolver e cadastrar equipamentos |
-| `diego@empresa.com` | Técnico | O mesmo que a Carla |
-| `ana@empresa.com` | Solicitante | Abrir chamados e ver só os próprios |
-| `bruno@empresa.com` | Solicitante | O mesmo que a Ana |
+| E-mail | Perfil |
+|---|---|
+| admin@empresa.com | Administrador |
+| carla@empresa.com | Técnica (use esta para o fluxo completo) |
+| diego@empresa.com | Técnico |
+| ana@empresa.com | Solicitante (vê só os próprios chamados) |
+| bruno@empresa.com | Solicitante |
 
-Dicas:
-
-- Para testar o fluxo completo (abrir, atribuir, resolver e fechar), entre como **Carla**.
-- Para testar as permissões, entre como **Ana**: ela não vê os chamados do Bruno.
-- Para trocar a senha de todas as contas, defina `SENHA_EXEMPLO` no arquivo `.env`.
-- As contas só são criadas quando o sistema sobe com `DADOS_EXEMPLO=1` (o padrão), e só na primeira vez, com o banco vazio.
-
-> Estas contas têm senha conhecida e servem só para aula. Em produção, use `DADOS_EXEMPLO=0`.
+Estas contas têm senha conhecida e servem só para aula. Em produção, use `DADOS_EXEMPLO=0`.
 
 ### Configuração
 
-Copie `.env.example` para `.env` e ajuste. O principal é o `JWT_SEGREDO`, que assina os logins.
-O arquivo `.env` nunca deve ir para o GitHub (ele já está no `.gitignore`).
+Opcional. Copie `.env.example` para `.env` para trocar o tempo do login, a senha das contas de
+exemplo ou definir o seu próprio `JWT_SEGREDO`. O `.env` nunca vai para o GitHub.
 
-## Testes
-
-```bash
-pytest -q
-```
-
-São 36 testes, incluindo **testes de segurança** (`tests/test_seguranca.py`): login, token falso ou vencido,
-bloqueio de tentativas, permissões por perfil, campos extras e limites de tamanho.
-A cada envio ao GitHub, os testes rodam sozinhos e o `pip-audit` confere se alguma dependência tem falha conhecida.
-
-## Segurança
-
-Veja o que está protegido e o que fazer antes de usar em produção em [SECURITY.md](SECURITY.md).
-
-## Arquitetura atual (monólito)
-
-Uma aplicação, um banco e uma implantação. O código é dividido em **módulos**, e cada módulo
-só usa a **porta pública** do outro (o arquivo `servico.py`).
-
-```mermaid
-flowchart TB
-    Tela[Tela do HelpDesk] --> API
-    subgraph API[Aplicação HelpDesk · um processo]
-        Auth[auth]
-        Usuarios[usuarios]
-        Inventario[inventario]
-        Chamados[chamados]
-        Notificacoes[notificacoes]
-        Auth -->|confere a senha| Usuarios
-        Chamados -->|chamada de função| Usuarios
-        Chamados -->|chamada de função| Inventario
-        Chamados -->|chamada de função| Notificacoes
-    end
-    API --> BD[(Banco único)]
-```
-
-```
-app/
-├── main.py            # junta os módulos e sobe a aplicação
-├── config.py          # configurações (variáveis de ambiente)
-├── database.py        # conexão com o banco único
-├── seguranca_http.py  # cabeçalhos de segurança e limite de tamanho
-├── erros.py           # erros de negócio
-├── dados_exemplo.py   # dados iniciais (só para aula)
-├── web/               # tela: index.html, app.js, estilo.css
-├── auth/              # senhas (scrypt), tokens JWT, login, limite de tentativas
-├── usuarios/          # modelos, esquemas, repositorio, servico (público), rotas
-├── inventario/
-├── chamados/          # depende de usuarios, inventario e notificacoes
-└── notificacoes/
-```
-
-Em `app/chamados/servico.py`, os comentários `# vira chamada HTTP` e `# vira evento` marcam
-os pontos que mudam quando o sistema for separado.
-
-## Rotas principais
+## Rotas (pelo gateway, porta 8000)
 
 Todas exigem login, exceto `/auth/login` e `/saude`.
 
-| Método | Rota | O que faz | Quem pode |
+| Método | Rota | Serviço | Quem pode |
 |---|---|---|---|
-| POST | `/auth/login` | Entra e recebe o token | Todos |
-| GET | `/auth/eu` | Dados de quem está logado | Logado |
-| POST | `/usuarios` | Cria usuário | Admin |
-| GET | `/usuarios` | Lista usuários (sem e-mail) | Logado |
-| POST / GET | `/ativos` | Cria e lista equipamentos | Técnico e admin / logado |
-| POST | `/chamados` | Abre chamado em nome de quem está logado | Logado |
-| GET | `/chamados` | Lista chamados | Logado (solicitante vê só os seus) |
-| GET | `/chamados/painel` | Totais por status e atrasados | Logado |
-| PATCH | `/chamados/{id}/atribuir` | Atribui a um técnico | Técnico e admin |
-| PATCH | `/chamados/{id}/status` | Muda o status | Técnico e admin (solicitante: fechar ou reabrir) |
-| POST | `/chamados/{id}/comentarios` | Comenta no chamado | Envolvidos |
-| GET | `/notificacoes` | Minhas notificações | Logado |
+| POST | `/auth/login` | usuarios | Todos |
+| GET | `/auth/eu` | usuarios | Logado |
+| POST / GET | `/usuarios` | usuarios | Admin / logado |
+| GET | `/usuarios/{id}` | usuarios | Logado (usado por chamados) |
+| POST / GET | `/ativos` | inventario | Técnico e admin / logado |
+| GET | `/ativos/{id}` | inventario | Logado (usado por chamados) |
+| POST / GET | `/chamados` | chamados | Logado (solicitante vê só os seus) |
+| GET | `/chamados/painel` | chamados | Logado |
+| PATCH | `/chamados/{id}/atribuir` | chamados | Técnico e admin |
+| PATCH | `/chamados/{id}/status` | chamados | Técnico e admin (solicitante: fechar ou reabrir) |
+| POST | `/chamados/{id}/comentarios` | chamados | Envolvidos |
+| GET | `/notificacoes` | notificacoes | Logado (só as próprias) |
+| GET | `/saude` | gateway | Todos |
+
+## Decisões
+
+**Login só no serviço de Usuários; cada serviço confere o token sozinho.**
+O JWT é assinado com um segredo compartilhado (`JWT_SEGREDO`). Cada serviço valida assinatura,
+emissor, validade e perfil sem chamar Usuários a cada requisição. Assim um serviço não depende
+de Usuários estar no ar só para saber quem é o usuário. O lado ruim: um usuário desativado
+continua com acesso até o token vencer (60 min). O gateway não confere o token, só encaminha.
+Mesmo que alguém chegasse direto a um serviço, ainda precisaria de um token válido.
+
+**Biblioteca `comum/` só com código técnico.**
+Token, cabeçalhos de segurança e tratamento de erros ficam em um lugar só, para não copiar o
+mesmo código de segurança cinco vezes. Ela não tem regra de negócio nem modelos de banco: cada
+serviço continua dono dos seus dados. Cada imagem copia a sua cópia da `comum/` no build.
+
+**Um PostgreSQL por serviço, sem chaves estrangeiras entre serviços.**
+A tabela `chamados` guarda só `solicitante_id`, `tecnico_id` e `ativo_id`. A existência do
+técnico e do equipamento é conferida por HTTP na hora de gravar. A chave estrangeira
+`comentarios → chamados` continua, porque as duas tabelas são do mesmo serviço.
+
+**Chamadas HTTP com timeout e 503.**
+`servicos/chamados/app/clientes.py` faz `GET /usuarios/{id}` e `GET /ativos/{id}` com tempo
+limite de 3 s e repassa o token do usuário. Se o outro serviço estiver fora do ar ou demorar,
+a resposta é **503** com uma mensagem clara, e nada é gravado. Abrir chamado *sem* equipamento
+não depende do Inventário e continua funcionando com ele fora do ar.
+
+**Notificações por evento (Redis).**
+Em vez de chamar Notificações, Chamados publica `ChamadoAberto`, `ChamadoAtribuido` e
+`ChamadoResolvido` em uma lista do Redis (`LPUSH`). O serviço de Notificações consome com
+`BRPOP` e grava os avisos. Se Notificações cair, os eventos esperam na fila e são lidos quando
+ele voltar. Se o Redis cair, o chamado é salvo do mesmo jeito e só o aviso se perde (fica no
+log). Para não perder nem isso, o próximo passo seria o padrão *outbox*.
+
+**Gateway em FastAPI, não Nginx.**
+Ele também serve a tela, mostra a saúde de todos os serviços em `/saude`, devolve 503 com
+mensagem em português quando um serviço cai e só repassa os cabeçalhos necessários
+(sobrescrevendo o `X-Forwarded-For` com o IP real).
+
+**Segredos gerados na primeira subida.**
+Para `docker compose up --build` funcionar sem ajuste manual e sem segredo no código, o
+contêiner `segredos` cria o segredo do JWT e a senha dos bancos em um volume. Se o `.env`
+definir `JWT_SEGREDO`, ele tem prioridade.
+
+**Dados de exemplo com ids fixos.**
+Cada serviço cria os seus dados de exemplo sozinho. Os chamados de exemplo usam os ids que os
+outros serviços criam (Ana = 2, Bruno = 3, Carla = 4, equipamentos 1 e 2), para a subida não
+depender da rede.
+
+## O que melhorou e o que ficou mais difícil
+
+| Melhorou | Ficou mais difícil |
+|---|---|
+| Cada serviço pode ser publicado, escalado e reiniciado sozinho. | Agora existe a rede no meio: latência, timeouts e falhas parciais. |
+| A queda de um serviço não derruba o sistema todo (só as rotas dele respondem 503). | Não há mais transação única: atribuir faz uma chamada HTTP e depois grava. |
+| Cada time é dono do seu código e do seu banco. | Sem chave estrangeira, a integridade entre serviços é conferida pela aplicação. |
+| Notificações não atrasam nem derrubam a abertura de chamados. | Avisos são eventuais (chegam um instante depois) e podem se perder se o Redis cair. |
+| Os testes de cada serviço rodam separados e mais rápido. | Mais peças para subir, monitorar e proteger (10 contêineres em vez de 1). |
+
+## Testes
+
+Cada serviço tem os seus testes, incluindo os de segurança (token falso, vencido, `alg: none`,
+perfil inventado, permissões, campos extras, limites de tamanho). Os serviços vizinhos são
+simulados com `httpx.MockTransport`, então o código de rede de verdade é testado, inclusive
+quedas e timeouts.
+
+```bash
+cd servicos/chamados   # ou usuarios, inventario, notificacoes, gateway
+pip install -r requirements.txt pytest httpx
+pytest -q
+```
+
+No GitHub Actions, cada serviço roda em um job separado, com `pip-audit` nas dependências, e
+há uma checagem de que só o gateway publica porta.
+
+## Segurança
+
+Veja [SECURITY.md](SECURITY.md).
