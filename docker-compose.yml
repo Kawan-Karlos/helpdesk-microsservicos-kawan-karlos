@@ -31,7 +31,7 @@ services:
   # Gera os segredos (JWT e senha dos bancos) na primeira subida e guarda num volume.
   # Nenhum segredo fica no código. Se o .env definir JWT_SEGREDO, ele tem prioridade.
   segredos:
-    image: alpine:3.22
+    image: alpine:3.24
     command:
       - sh
       - -c
