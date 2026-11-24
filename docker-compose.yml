@@ -1,22 +1,152 @@
+# HelpDesk TI em microsserviços.
+# Só o gateway publica porta (8000). Serviços, bancos e fila ficam na rede interna do Docker.
+
+x-servico: &servico
+  env_file:
+    - path: .env
+      required: false
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  restart: unless-stopped
+  volumes:
+    - segredos:/segredos:ro
+
+x-banco: &banco
+  image: postgres:17-alpine
+  restart: unless-stopped
+  environment: &banco-env
+    POSTGRES_PASSWORD_FILE: /segredos/db
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+    interval: 3s
+    retries: 20
+
+x-segredos-prontos: &segredos-prontos
+  segredos:
+    condition: service_completed_successfully
+
 services:
-  helpdesk:
-    build: .
-    ports:
-      - "127.0.0.1:8000:8000"   # só acessível pelo próprio computador
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DADOS_EXEMPLO: ${DADOS_EXEMPLO:-1}
+  # Gera os segredos (JWT e senha dos bancos) na primeira subida e guarda num volume.
+  # Nenhum segredo fica no código. Se o .env definir JWT_SEGREDO, ele tem prioridade.
+  segredos:
+    image: alpine:3.22
+    command:
+      - sh
+      - -c
+      - |
+        umask 022
+        for s in jwt db; do
+          [ -s /segredos/$$s ] || head -c 48 /dev/urandom | base64 | tr -d '\n/+=' > /segredos/$$s
+        done
+        echo "segredos prontos"
     volumes:
-      - dados:/dados
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      - segredos:/segredos
+
+  gateway:
+    <<: *servico
+    build: { context: ., dockerfile: gateway/Dockerfile }
+    ports:
+      - "127.0.0.1:8000:8000"   # o único ponto de entrada (só no próprio computador)
+    volumes: []
+    depends_on: [usuarios, inventario, chamados, notificacoes]
+
+  usuarios:
+    <<: *servico
+    build: { context: ., dockerfile: servicos/usuarios/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql+psycopg://usuarios:{senha}@db-usuarios:5432/usuarios
+      DB_SENHA_ARQUIVO: /segredos/db
+      JWT_SEGREDO_ARQUIVO: /segredos/jwt
+      DADOS_EXEMPLO: ${DADOS_EXEMPLO:-1}
+    depends_on:
+      <<: *segredos-prontos
+      db-usuarios: { condition: service_healthy }
+
+  inventario:
+    <<: *servico
+    build: { context: ., dockerfile: servicos/inventario/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql+psycopg://inventario:{senha}@db-inventario:5432/inventario
+      DB_SENHA_ARQUIVO: /segredos/db
+      JWT_SEGREDO_ARQUIVO: /segredos/jwt
+      DADOS_EXEMPLO: ${DADOS_EXEMPLO:-1}
+    depends_on:
+      <<: *segredos-prontos
+      db-inventario: { condition: service_healthy }
+
+  chamados:
+    <<: *servico
+    build: { context: ., dockerfile: servicos/chamados/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql+psycopg://chamados:{senha}@db-chamados:5432/chamados
+      DB_SENHA_ARQUIVO: /segredos/db
+      JWT_SEGREDO_ARQUIVO: /segredos/jwt
+      DADOS_EXEMPLO: ${DADOS_EXEMPLO:-1}
+      USUARIOS_URL: http://usuarios:8000
+      INVENTARIO_URL: http://inventario:8000
+      REDIS_URL: redis://redis:6379/0
+      TIMEOUT_SEGUNDOS: "3"
+    # Não depende de usuarios/inventario para SUBIR: se eles caírem, chamados continua no ar
+    depends_on:
+      <<: *segredos-prontos
+      db-chamados: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  notificacoes:
+    <<: *servico
+    build: { context: ., dockerfile: servicos/notificacoes/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql+psycopg://notificacoes:{senha}@db-notificacoes:5432/notificacoes
+      DB_SENHA_ARQUIVO: /segredos/db
+      JWT_SEGREDO_ARQUIVO: /segredos/jwt
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      <<: *segredos-prontos
+      db-notificacoes: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # ---------- um banco por serviço ----------
+  db-usuarios:
+    <<: *banco
+    environment: { <<: *banco-env, POSTGRES_USER: usuarios, POSTGRES_DB: usuarios }
+    volumes: [dados-usuarios:/var/lib/postgresql/data, segredos:/segredos:ro]
+    depends_on: *segredos-prontos
+
+  db-inventario:
+    <<: *banco
+    environment: { <<: *banco-env, POSTGRES_USER: inventario, POSTGRES_DB: inventario }
+    volumes: [dados-inventario:/var/lib/postgresql/data, segredos:/segredos:ro]
+    depends_on: *segredos-prontos
+
+  db-chamados:
+    <<: *banco
+    environment: { <<: *banco-env, POSTGRES_USER: chamados, POSTGRES_DB: chamados }
+    volumes: [dados-chamados:/var/lib/postgresql/data, segredos:/segredos:ro]
+    depends_on: *segredos-prontos
+
+  db-notificacoes:
+    <<: *banco
+    environment: { <<: *banco-env, POSTGRES_USER: notificacoes, POSTGRES_DB: notificacoes }
+    volumes: [dados-notificacoes:/var/lib/postgresql/data, segredos:/segredos:ro]
+    depends_on: *segredos-prontos
+
+  # ---------- fila de eventos ----------
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]   # a fila sobrevive a reinícios
+    volumes: [dados-fila:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
 
 volumes:
-  dados:
+  segredos:
+  dados-usuarios:
+  dados-inventario:
+  dados-chamados:
+  dados-notificacoes:
+  dados-fila:
