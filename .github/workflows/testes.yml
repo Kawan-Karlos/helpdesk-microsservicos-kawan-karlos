@@ -6,8 +6,17 @@ permissions:
   contents: read
 
 jobs:
+  # Cada serviço é testado sozinho, com as próprias dependências
   testes:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        servico: [servicos/usuarios, servicos/inventario, servicos/chamados, servicos/notificacoes, gateway]
+    name: ${{ matrix.servico }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.servico }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -15,8 +24,22 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements.txt pytest==9.2.0 httpx==0.28.1 pip-audit==2.10.1
       - name: Testes (inclui testes de segurança)
         run: pytest -q
+        env:
+          DATABASE_URL: "sqlite:///:memory:"
       - name: Dependências com falhas conhecidas
         run: pip-audit -r requirements.txt
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: docker-compose.yml é válido
+        run: docker compose config --quiet
+      - name: Só o gateway publica porta
+        run: |
+          test "$(docker compose config --format json | jq '[.services[] | select(.ports != null)] | length')" = "1"
