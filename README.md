@@ -1,6 +1,6 @@
 # HelpDesk TI · versão em microsserviços
 
-> 🎥 **Vídeo de demonstração:** COLE_AQUI_O_LINK_DO_VIDEO
+> 🎥 **Vídeo de demonstração:** https://youtu.be/tdGbuqUKAzo
 
 Sistema de chamados de TI (no estilo de um GLPI simplificado), feito em Python + FastAPI.
 Começou como um monólito ([projeto base](https://github.com/prof-filipecavalcante/helpdesk-ti))
